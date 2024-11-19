@@ -23,6 +23,7 @@ package signaling
 
 import (
 	"context"
+	"encoding/json"
 	"net/url"
 	"strconv"
 	"testing"
@@ -264,4 +265,93 @@ func TestBandwidth_Backend(t *testing.T) {
 			assert.Equal(expectBitrate, pub.settings.Bitrate)
 		})
 	}
+}
+
+func TestFeatureChatRelay(t *testing.T) {
+	t.Parallel()
+	CatchLogForTest(t)
+
+	testFunc := func(feature bool) func(t *testing.T) {
+		return func(t *testing.T) {
+			t.Parallel()
+			require := require.New(t)
+			assert := assert.New(t)
+			hub, _, _, server := CreateHubForTest(t)
+
+			client := NewTestClient(t, server, hub)
+			defer client.CloseWithBye()
+			var features []string
+			if feature {
+				features = append(features, ClientFeatureChatRelay)
+			}
+			require.NoError(client.SendHelloClientWithFeatures(testDefaultUserId, features))
+
+			ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+			defer cancel()
+
+			hello, err := client.RunUntilHello(ctx)
+			require.NoError(err)
+
+			roomId := "test-room"
+			roomMsg, err := client.JoinRoom(ctx, roomId)
+			require.NoError(err)
+			require.Equal(roomId, roomMsg.Room.RoomId)
+
+			assert.NoError(client.RunUntilJoined(ctx, hello.Hello))
+
+			room := hub.getRoom(roomId)
+			require.NotNil(room)
+
+			chatComment := map[string]interface{}{
+				"foo": "bar",
+				"baz": true,
+				"lala": map[string]interface{}{
+					"one": "eins",
+				},
+			}
+			message := map[string]interface{}{
+				"type": "chat",
+				"chat": map[string]interface{}{
+					"refresh": true,
+					"comment": chatComment,
+				},
+			}
+			data, err := json.Marshal(message)
+			require.NoError(err)
+
+			// Simulate request from the backend.
+			room.ProcessBackendRoomRequest(&AsyncMessage{
+				Type: "room",
+				Room: &BackendServerRoomRequest{
+					Type: "message",
+					Message: &BackendRoomMessageRequest{
+						Data: data,
+					},
+				},
+			})
+
+			if msg, err := client.RunUntilRoomMessage(ctx); assert.NoError(err) {
+				assert.Equal(roomId, msg.RoomId)
+				var data map[string]interface{}
+				if err := json.Unmarshal(msg.Data, &data); assert.NoError(err) {
+					assert.Equal("chat", data["type"])
+					if c, found := data["chat"]; assert.True(found, "chat entry is missing") {
+						chat := c.(map[string]interface{})
+						if feature {
+							assert.Equal(chatComment, chat["comment"])
+							_, found := chat["refresh"]
+							assert.False(found, "refresh should not be included")
+						} else {
+							assert.Equal(true, chat["refresh"])
+							_, found := chat["comment"]
+							assert.False(found, "the comment should not be included")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	t.Run("without-chat-relay", testFunc(false))
+	t.Run("with-chat-relay", testFunc(true))
 }
